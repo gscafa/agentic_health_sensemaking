@@ -1,0 +1,17 @@
+[project]
+name = "agentic-health-sensemaking"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "bep", email = "g.scafa18@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+agentic-health-sensemaking = "agentic_health_sensemaking:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
