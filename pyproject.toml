@@ -7,7 +7,12 @@ authors = [
     { name = "bep", email = "g.scafa18@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "pydantic-ai>=2.59.0",
+    "pymongo>=4.19.0",
+]
 
 [project.scripts]
 agentic-health-sensemaking = "agentic_health_sensemaking:main"
@@ -15,3 +20,8 @@ agentic-health-sensemaking = "agentic_health_sensemaking:main"
 [build-system]
 requires = ["uv_build>=0.12.8,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+]
