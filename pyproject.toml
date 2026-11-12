@@ -8,10 +8,12 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "docker>=7.2.0",
     "numpy>=2.5.4",
     "pandas>=3.0.6",
     "pydantic-ai>=2.59.0",
     "pymongo>=4.19.0",
+    "python-dotenv>=1.2.4",
 ]
 
 [project.scripts]
