@@ -205,10 +205,10 @@ def get_historical_weather(
         return []
 
 
-# Explicit list of exposed tools for PydanticAI agent registration
-BASE_TOOLS = [
-    get_daily_summary,
-    get_hourly_slice,
-    get_ema_surveys,
-    get_historical_weather,
-]
+# Explicit mapping of exposed tools for PydanticAI agent registration and lookup
+BASE_TOOLS = {
+    "get_daily_summary": get_daily_summary,
+    "get_hourly_slice": get_hourly_slice,
+    "get_ema_surveys": get_ema_surveys,
+    "get_historical_weather": get_historical_weather,
+}

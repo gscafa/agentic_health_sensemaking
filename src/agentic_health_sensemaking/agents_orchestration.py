@@ -3,56 +3,73 @@ from pathlib import Path
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 from pydantic import BaseModel, Field
-from agents_configuration import load_agents, SensemakingDeps
+from agentic_health_sensemaking.agents_configuration import load_agents, SensemakingDeps, PlanModel
 import docker
+from agentic_health_sensemaking.base_helper_functions import (
+    get_daily_summary,
+    get_hourly_slice,
+    get_ema_surveys,
+    get_historical_weather,
+)
+from agentic_health_sensemaking.base_helper_functions import BASE_TOOLS
 
 planner_agent, coding_agent, sensemaking_agent, presentation_agent = load_agents()
 
 uid = "8391d8b451084771d0affcc26e34d773"
-prompt = f"User {uid} said he was anxious in the morning of 12th June 2018. Why could that be?"
+prompt = f"How physically active was user {uid} on 2018-09-11"
 shared_memory = SensemakingDeps(user_query=prompt)
 
-total_start_time = time.perf_counter()
+
 
 # Planner Agent
-t0 = time.perf_counter()
-result = planner_agent.run_sync(prompt, retries=2)
-planner_elapsed = time.perf_counter() - t0
+print("PLANNER AGENT")
+result = planner_agent.run_sync(prompt)
 
-shared_memory.uid = result.output.uid
-shared_memory.action_plan = result.output.action_plan
-print("PLAN AGENT")
-print(shared_memory)
+plan_output: PlanModel = result.output
+
+shared_memory.uid = uid
+shared_memory.triangulation_instructions = plan_output.triangulation_instructions
+
+for function in plan_output.retrieval_functions:
+    
+    exec_function = BASE_TOOLS[function.name]
+    
+    record = {
+        "source": function.name,
+        "date_range": str(function.params.get("start_date")) + "/" + str(function.params.get("end_date")),
+        "records": exec_function(**function.params)
+    }
+
+    shared_memory.collected_data.append(record)
+
+#print(plan_output.retrieval_functions)
+#print(plan_output.triangulation_instructions)
+
 print("\n\n")
+#shared_memory.triangulation_instructions = None
+if(shared_memory.triangulation_instructions and shared_memory.collected_data):
 
 # Coding Agent
-t0 = time.perf_counter()
-result = coding_agent.run_sync("Follow the instructions", deps=shared_memory, retries=2)
-coding_elapsed = time.perf_counter() - t0
 
-print("CODE AGENT")
-print(shared_memory)
-print("\n\n")
+    print("CODING AGENT")
+    result = coding_agent.run_sync("Proceed", deps=shared_memory)
+
+
+    #print(shared_memory.collected_data)
+    print(shared_memory)
+    print("\n\n")
+    
+    
+
 
 # Sensemaking Agent
-print("SENSEMAKER")
-t0 = time.perf_counter()
+print("SENSEMAKING AGENT")
+
 result = sensemaking_agent.run_sync("Answer the user query", deps=shared_memory, retries=2)
-sensemaking_elapsed = time.perf_counter() - t0
+
 
 shared_memory.understanding = result.output.sensemaking
 shared_memory.is_complete = result.output.is_complete
 
 print(f"{shared_memory.understanding}\n {shared_memory.is_complete}")
 
-total_elapsed = time.perf_counter() - total_start_time
-
-print("\n" + "=" * 40)
-print("EXECUTION TIME METRICS")
-print("=" * 40)
-print(f"Planner Agent:     {planner_elapsed:6.2f} s")
-print(f"Coding Agent:      {coding_elapsed:6.2f} s")
-print(f"Sensemaking Agent: {sensemaking_elapsed:6.2f} s")
-print("-" * 40)
-print(f"Total Elapsed:     {total_elapsed:6.2f} s")
-print("=" * 40)

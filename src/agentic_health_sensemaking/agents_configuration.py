@@ -1,12 +1,16 @@
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, NativeOutput, ModelSettings
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.exceptions import ModelRetry
 from pydantic import BaseModel, Field
-from base_helper_functions import (
+import json
+import docker
+import tempfile
+
+from agentic_health_sensemaking.base_helper_functions import (
     get_daily_summary,
     get_hourly_slice,
     get_ema_surveys,
@@ -15,6 +19,8 @@ from base_helper_functions import (
 
 root_dir = Path(".").resolve()
 load_dotenv(dotenv_path=root_dir / ".env")
+
+docker_sandbox = docker.from_env()
 
 models = {
 "gemma4_e4b": "s1gnature/gemma4-mtp:e4b-q4_k_m",
@@ -28,12 +34,13 @@ base_url="http://localhost:11434/v1"
 )
 
 model = OllamaModel(
-model_name=models.get('gemma4_e2b'),
-provider=ollama_provider
+model_name=models.get('gemma4_e4b'),
+provider=ollama_provider,
+settings=ModelSettings(temperature=0.2)
     )
 
 
-data_dictionary = """### AVAILABLE DATA DICTIONARY & RETRIEVAL SURFACES
+_data_dictionary = """### AVAILABLE DATA DICTIONARY & RETRIEVAL SURFACES
 
 1. COLLECTION: daily_data (Helper: get_daily_summary(uid, start_date, end_date, fields=[...]))
    - Granularity: 1 record per day ('YYYY-MM-DD').
@@ -47,7 +54,7 @@ data_dictionary = """### AVAILABLE DATA DICTIONARY & RETRIEVAL SURFACES
      'unlock_duration', 'unlock_num', 'audio_convo_duration', 'other_playing_duration'
    - Phone Calls:
      'call_in_duration', 'call_in_num', 'call_out_duration', 'call_out_num', 'call_miss_num'
-   - Sleep (seconds):
+   - Sleep (hours):
      'sleep_duration'
 
 2. COLLECTION: hourly_data (Helper: get_hourly_slice(uid, start_date, end_date, start_hour, end_hour, fields=[...]))
@@ -72,19 +79,103 @@ STRICT RULES:
 - Always instruct the coding agent to pass minimal 'fields=[...]' lists matching the query intent.
 - Note: Continuous heart rate and raw GPS coordinates are NOT available in this dataset."""
 
+
+
+_planner_system_prompt = (
+    """You are a health sensemaking planner. Output ONLY valid JSON matching the PlanModel schema. Do NOT output markdown, headings, or prose.
+
+"""
+    + _data_dictionary
+    + """
+
+TASK:
+1. Extract the target `uid` and date range from the user query.
+2. Populate `retrieval_functions` with the exact helper function names and their keyword arguments inside `params` (including minimal `fields` lists when supported).
+3. Set `triangulation_instructions`:
+   - Set to `null` for simple factual lookups (e.g., retrieving a single day's steps, sleep, or survey score) where the raw fetched records directly answer the question.
+   - Populate with concise Python calculation instructions ONLY when the query requires averages, totals, percentages, anomaly detection, or cross-dataset correlations.
+
+EXAMPLE OUTPUT:
+{
+  "uid": "8391d8b451084771d0affcc26e34d773",
+  "retrieval_functions": [
+    {
+      "name": "get_daily_summary",
+      "params": {
+        "uid": "8391d8b451084771d0affcc26e34d773",
+        "start_date": "2018-06-24",
+        "end_date": "2018-06-30",
+        "fields": ["sleep_duration", "step", "loc_workout_dur"]
+      }
+    },
+    {
+      "name": "get_historical_weather",
+      "params": {
+        "start_date": "2018-06-24",
+        "end_date": "2018-06-30",
+        "hourly": false
+      }
+    }
+  ],
+  "triangulation_instructions": "Compute daily mean and min for sleep_duration and step. Correlate low-sleep or low-step days against precipitation_sum and temperature extremes."
+}"""
+)
+
+_coding_agent_prompt = """You are a deterministic Python data analysis agent. Call `execute_python_code(code=...)` with a script fulfilling `Triangulation Instructions`.
+
+### INPUT & SCHEMA
+- Load `/workspace/input_data.json`: a list of `{"source": "<name>", "records": [...]}` blocks.
+- Match `block["source"]` to `Available Sources & Schemas` in your context. Use ONLY listed column keys; handle empty `records` gracefully.
+- NEVER hardcode mock data, write code comments, or use `try/except` blocks (let errors fail loudly).
+
+### PROCESSING & TRIANGULATION
+- Build `pandas.DataFrame`s and coerce numeric columns with `pd.to_numeric(..., errors="coerce")`.
+- **Unmerged Baselines First**: Before merging, compute `count`, `mean`, `min`, `max` (with dates/keys), and `std` for every analyzed metric on its original DataFrame.
+- **Safe Merging & Filtering**: Normalize temporal keys, then merge using `how="left"` anchored on the densest source (never `how="inner"`). NEVER call `merged_df.dropna()` across mixed sources; drop `NaN`s pairwise per calculation (`df[[a, b]].dropna()`).
+- **Valid Correlations & Thresholds**: Compute correlations only when paired valid rows >= 5 and both `std() > 0` (otherwise record `None` with a reason). Define anomalies using sample-relative stats (`mean ± std` or quantiles), never hardcoded domain cutoffs.
+
+### OUTPUT
+- Replace `NaN`/`inf` with `None` and end with a single `print(json.dumps(result_dict, default=str))`. No other prints.
+- After `execute_python_code` succeeds, reply strictly with: `COMPUTATION_COMPLETE`."""
+
+_sensemaking_agent_prompt = """You are a sensemaking expert. Your role is to analyze a collection of health and behavioural data from a user. 
+                Use that data to reason and find an answer to the user query. Interpret the data based on the request. Be concise. State only useful facts.
+                Set 'is_complete' as False if you think that the current data retrieval and analysis are enough and not improvable.
+                Set 'is_complete' as True if 
+                    - you think the data is sufficient to answer the user query 
+                    - you think the data is not sufficient but there is more data to fetch that could improve the analysis
+                """
+class RetrievalFunction(BaseModel):
+    name: str = Field(description="Exact helper function name from the Data Dictionary")
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Keyword arguments matching the function signature (e.g., uid, start_date, end_date, hourly, fields)",
+    )
+
 class SensemakingDeps(BaseModel):
     uid: str = ""
     user_query: str = Field(description="The user request")
-    action_plan: List[str] = Field(default_factory=list)
+    triangulation_instructions: Optional[str] = None
     iteration: int = 0
     collected_data: List[Dict[str, Any]] = Field(default_factory=list)
+    computed_data: List[Dict[str, Any]] = Field(default_factory=list)
     understanding: str = ""
-    is_complete: bool = Field(default=False, description="Wether the current sensemaking successfully satisfies the user query")
+    is_complete: bool = Field(
+        default=False,
+        description="Whether the current sensemaking successfully satisfies the user query",
+    )
 
 
 class PlanModel(BaseModel):
     uid: str = Field(description="The target user")
-    action_plan: List[str] = Field(description="The steps necessary to answer the user query")
+    retrieval_functions: List[RetrievalFunction] = Field(
+        default_factory=list,
+        description="The list of filled python data retrieval functions that will be executed",
+    )
+    triangulation_instructions: Optional[str] = Field(
+        default=None,
+        description="Python calculation/correlation instructions, or null if raw fetched records directly answer the query",
+    )
 
 class SensemakingIteration(BaseModel):
     sensemaking: str = Field(description="The data interpretation")
@@ -92,113 +183,120 @@ class SensemakingIteration(BaseModel):
 
 
 
+def run_docker_sandbox(code: str, data: list) -> str:
+    #print(f"CODE:\n {code}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        (temp_path / "input_data.json").write_text(json.dumps(data))
+        (temp_path / "script.py").write_text(code)
+
+
+        output = docker_sandbox.containers.run(
+            image="code-sandbox",
+            command="python /workspace/script.py",
+            volumes={str(temp_path): {"bind": "/workspace", "mode": "rw"}},
+            network_mode="none",
+            mem_limit="512m",
+            remove=True)
+        
+        return output.decode("utf-8")
+
+
+
 
 def load_agents():
+
+
 
     
     planner_agent = Agent(
         model=model,
-        system_prompt=f"""You are an expert in health sensemaking. Heres the data dictionary: {data_dictionary} .
-        Your task is to understand the user request and formulate a detailed plan to answer it. First, define what base data to fetch via the tools. 
-        Secondly, provide instructions of how the collected data should be programmatically triangulated and correlated to get better insights and facilitate sensemaking.
-        Be concise, avoid redundant syntax and symbols. Only state instructions. Avoid mentioning the uid everytime you specify a tool call""",
-        output_type=PlanModel
+        system_prompt=_planner_system_prompt,
+        output_type=NativeOutput(PlanModel),
+        retries=3
     )
+
+
+
+
 
 
     
     coding_agent = Agent(
         model=model,
-        system_prompt="You are a data analytics coding expert in health sensemaking. Follow the instructions, retrieve and display the requested data. Don't interpret the data, only return the data obtained with the tools in plain JSON",
-        deps_type=SensemakingDeps
+        system_prompt=_coding_agent_prompt,
+        deps_type=SensemakingDeps,
+        retries=3
     )
 
     @coding_agent.system_prompt
-    def inject_shared_memory(ctx:RunContext[SensemakingDeps])-> str:
+    def inject_coding_context(ctx: RunContext[SensemakingDeps]) -> str:
+        data_profile = []
+        for block in ctx.deps.collected_data:
+            records = block.get("records", [])
+            sample = records[:2]
+            col_types = (
+                {k: type(v).__name__ for k, v in records[0].items()}
+                if records
+                else {}
+            )
+            data_profile.append({
+                "source": block.get("source"),
+                "row_count": len(records),
+                "column_types": col_types,
+                "sample_rows": sample,
+            })
+
         return (
-            f"Target uid: {ctx.deps.uid}\n"
-            f"Action Plan: {ctx.deps.action_plan}"
+            f"Target UID: {ctx.deps.uid}\n"
+            f"Staged Data Profile in /workspace/input_data.json:\n{json.dumps(data_profile, default=str)}\n"
+            f"Triangulation Instructions:\n{ctx.deps.triangulation_instructions}"
         )
 
     @coding_agent.tool
-    def fetch_daily_summary(
-        ctx: RunContext[SensemakingDeps],
-        uid: str,
-        start_date: str,
-        end_date: str,
-        fields: Optional[List[str]] = None,
-    ) -> str:
-        """Fetches daily summary records and stores them directly in shared memory."""
-        records = get_daily_summary(uid=uid, start_date=start_date, end_date=end_date, fields=fields)
-        ctx.deps.collected_data.append({
-            "source": "daily_data",
-            "range": f"{start_date} to {end_date}",
-            "records": records,  
-        })
-        return f"SUCCESS: Saved {len(records)} daily records to shared memory."
+    def execute_python_code(ctx:RunContext[SensemakingDeps], code: str) -> str:
+        """Runs Python code to analyze /workspace/input_data.json ."""
 
-    @coding_agent.tool
-    def fetch_hourly_slice(
-        ctx: RunContext[SensemakingDeps],
-        uid: str,
-        start_date: str,
-        end_date: str,
-        start_hour: Optional[int] = None,
-        end_hour: Optional[int] = None,
-        fields: Optional[List[str]] = None,
-    ) -> str:
-        """Fetches hourly time-series records and stores them directly in shared memory."""
-        records = get_hourly_slice(
-            uid=uid,
-            start_date=start_date,
-            end_date=end_date,
-            start_hour=start_hour,
-            end_hour=end_hour,
-            fields=fields,
-        )
-        ctx.deps.collected_data.append({
-            "source": "hourly_data",
-            "range": f"{start_date} to {end_date}",
-            "hours": f"{start_hour or 0}-{end_hour if end_hour is not None else 23}",
-            "records": records,
-        })
-        return f"SUCCESS: Saved {len(records)} hourly records to shared memory."
+        print(f"CODE: \n {code}")
+        try:
+            stdout = run_docker_sandbox(code, ctx.deps.collected_data)
+            parsed_data = json.loads(stdout)
+        except docker.errors.ContainerError as e:
+            error_message = e.stderr.decode("utf-8") if e.stderr else str(e)
+            raise ModelRetry(f"The script failed its execution with error {error_message}. Retry")
+        except json.JSONDecodeError:
+            raise ModelRetry("Your script didn't return JSON output. Retry")
 
-    @coding_agent.tool
-    def fetch_ema_surveys(
-        ctx: RunContext[SensemakingDeps],
-        uid: str,
-        start_date: str,
-        end_date: str,
-        fields: Optional[List[str]] = None,
-    ) -> str:
-        """Fetches EMA survey records and stores them directly in shared memory."""
-        records = get_ema_surveys(uid=uid, start_date=start_date, end_date=end_date, fields=fields)
-        ctx.deps.collected_data.append({
-            "source": "ema_data",
-            "range": f"{start_date} to {end_date}",
-            "records": records,
-        })
-        return f"SUCCESS: Saved {len(records)} EMA records to shared memory."
+        ctx.deps.computed_data.append(parsed_data)
+        return "Done"
+
+
+
+
+
+
+
+
+
+
 
 
     sensemaking_agent = Agent(
         model=model,
-        system_prompt="""You are a sensemaking expert. Your role is to analyze a collection of health and behavioural data from a user. 
-                Use that data to reason and find an answer to the user query. Interpret the data based on the request. Be concise. State only useful facts
-                """,
+        system_prompt=_sensemaking_agent_prompt,
         deps_type=SensemakingDeps,
-        output_type=SensemakingIteration
-
+        output_type=SensemakingIteration,
+        retries=3
     )
 
     @sensemaking_agent.system_prompt
-    def s_inject_shared_memory(ctx:RunContext[SensemakingDeps]) -> str:
+    def inject_sensemaking_context(ctx:RunContext[SensemakingDeps]) -> str:
         return (
             f"Target uid: {ctx.deps.uid}\n"
             f"User Query: {ctx.deps.user_query}"
-            f"Action Plan: {ctx.deps.action_plan}"
+            f"Triangulation Instructions: {ctx.deps.triangulation_instructions}"
             f"Collected Data: {ctx.deps.collected_data}"
+            f"Computed Data: {ctx.deps.computed_data}"
         )
 
     
